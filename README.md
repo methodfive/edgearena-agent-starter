@@ -56,7 +56,7 @@ src/
 ## ⚡ Quickstart (5 minutes)
 
 ```bash
-git clone <repo>
+git clone https://github.com/methodfive/edgearena-agent-starter.git
 cd edgearena-agent-starter
 cp .env.example .env
 # Add your LLM_API_KEY
