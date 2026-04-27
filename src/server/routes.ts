@@ -16,6 +16,7 @@ import {
   type HandshakeResponse,
   PROTOCOL_VERSION,
   SIGNATURE_HEADER,
+  TIMESTAMP_HEADER,
 } from '../protocol/types';
 import {
   AnalystSimulationSchema,
@@ -25,7 +26,7 @@ import {
   ScoutSimulationSchema,
   formatZodError,
 } from '../protocol/validate';
-import { logError, logWarn } from '../utils/logger';
+import { logError } from '../utils/logger';
 import { verifySignature } from '../utils/signature';
 
 export interface RawBodyRequest extends Request {
@@ -118,27 +119,89 @@ async function handleSimulationRequest(req: Request, res: Response): Promise<voi
   }
 }
 
+/**
+ * In-memory LRU of taskIds we've already accepted. A duplicate dispatch
+ * — same taskId, same body, even with a fresh signature — is a replay and
+ * gets rejected. The cache is bounded so a long-running agent can't grow
+ * memory without limit; once an entry falls out, that taskId could in
+ * principle be replayed again, but only after `MAX_PROCESSED_TASK_IDS`
+ * other tasks went by AND its timestamp is still inside the tolerance
+ * window — both unlikely in practice. Production agents that need
+ * stronger guarantees should swap this for a Redis/DB-backed store.
+ */
+const MAX_PROCESSED_TASK_IDS = 1024;
+const processedTaskIds = new Set<string>();
+
+function rememberTaskId(taskId: string): void {
+  processedTaskIds.add(taskId);
+  if (processedTaskIds.size > MAX_PROCESSED_TASK_IDS) {
+    // Set iteration order is insertion order — drop the oldest.
+    const oldest = processedTaskIds.values().next().value;
+    if (oldest !== undefined) processedTaskIds.delete(oldest);
+  }
+}
+
+/** Test-only hook: clear the dedupe cache between cases. */
+export function __resetProcessedTaskIdsForTests(): void {
+  processedTaskIds.clear();
+}
+
 async function handleDispatchRequest(req: RawBodyRequest, res: Response): Promise<void> {
   const parsed = DispatchSchema.safeParse(req.body);
   if (!parsed.success) return void badRequest(res, formatZodError(parsed.error));
 
   const rawBody = req.rawBody ?? '';
   const providedSig = headerAsString(req.headers[SIGNATURE_HEADER]);
+  const providedTs = headerAsString(req.headers[TIMESTAMP_HEADER]);
+  const timestamp = Number(providedTs);
 
-  if (config.edgearenaApiKey) {
-    if (!providedSig || !verifySignature(rawBody, config.edgearenaApiKey, providedSig)) {
-      res.status(401).json({
-        error: 'Invalid or missing signature',
-        code: 'invalid_signature',
-      } satisfies ErrorResponse);
-      return;
-    }
-  } else {
-    logWarn('unverified_dispatch', {
-      note: 'EDGEARENA_API_KEY not set — signature was not verified.',
+  // Reconstruct the URL the platform signed against. We trust `Host` plus
+  // the request path here — agents behind a proxy that rewrites these
+  // headers will need to derive the canonical URL differently (e.g. from
+  // a configured public URL).
+  const host = headerAsString(req.headers.host);
+  const path = (req.originalUrl ?? req.url ?? '/').split('?')[0];
+  const targetUrl = `https://${host}${path}`;
+
+  // Dispatches are HMAC-authenticated. Refuse to process them at all when
+  // EDGEARENA_API_KEY isn't configured — running unauthenticated would let
+  // any caller spoof tasks and damage the agent's reputation. The agent
+  // *must* be configured with the key the platform issued at registration.
+  if (!config.edgearenaApiKey) {
+    logError('dispatch_misconfigured', {
+      note: 'EDGEARENA_API_KEY not set — refusing dispatch. Set the env var to the key shown during agent registration.',
       taskId: parsed.data.taskId,
     });
+    res.status(401).json({
+      error: 'Agent is misconfigured: EDGEARENA_API_KEY env var is not set',
+      code: 'agent_not_configured',
+    } satisfies ErrorResponse);
+    return;
   }
+  if (
+    !providedSig ||
+    !verifySignature(rawBody, config.edgearenaApiKey, providedSig, timestamp, targetUrl)
+  ) {
+    res.status(401).json({
+      error: 'Invalid, missing, or expired signature',
+      code: 'invalid_signature',
+    } satisfies ErrorResponse);
+    return;
+  }
+
+  // Replay defence in depth: even when the signature, timestamp window,
+  // and URL all check out, a request reusing a taskId we've already
+  // accepted is rejected. Combined with the timestamp window, this
+  // closes the small window where a captured request could be replayed
+  // before its timestamp expires.
+  if (processedTaskIds.has(parsed.data.taskId)) {
+    res.status(409).json({
+      error: 'Task already processed',
+      code: 'duplicate_task',
+    } satisfies ErrorResponse);
+    return;
+  }
+  rememberTaskId(parsed.data.taskId);
 
   try {
     const { output, usage } = await handleDispatch(parsed.data, {
@@ -170,13 +233,25 @@ function writeAgentError(
   extra: Record<string, unknown> = {},
 ): void {
   if (err instanceof AgentTaskError) {
-    logError(event, { ...extra, reason: err.reason, message: err.message });
+    logError(event, {
+      ...extra,
+      reason: err.reason,
+      message: err.message,
+      ...(err.rawOutput !== undefined ? { rawOutput: err.rawOutput.slice(0, 500) } : {}),
+    });
     if (!res.headersSent) {
+      // Surface the validation message and a snippet of the model's raw text
+      // so the caller can show *why* validation failed (e.g. wizard's
+      // "View technical details" panel). Capped at 4 KB to keep responses
+      // small while still being useful for debugging.
+      const rawSnippet = err.rawOutput?.slice(0, 4096);
       res.status(502).json({
         error: err.reason === 'llm_error'
           ? 'Upstream model call failed'
           : 'Agent produced an invalid response',
         code: err.reason,
+        ...(err.reason === 'invalid_output' ? { validationError: err.message } : {}),
+        ...(rawSnippet !== undefined ? { rawOutput: rawSnippet } : {}),
       } satisfies ErrorResponse);
     }
     return;

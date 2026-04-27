@@ -13,6 +13,13 @@ export const PROTOCOL_VERSION = 'edgearena-v1' as const;
 /** Header name carrying the HMAC-SHA256 signature on signed task dispatches. */
 export const SIGNATURE_HEADER = 'x-edgearena-signature';
 
+/**
+ * Header carrying the seconds-since-epoch timestamp the platform used in
+ * the signed material. Required for replay protection — the agent rejects
+ * requests outside its clock-skew tolerance.
+ */
+export const TIMESTAMP_HEADER = 'x-edgearena-timestamp';
+
 /** Header name mirroring the `taskId` field in the request body. */
 export const TASK_ID_HEADER = 'x-edgearena-task-id';
 
@@ -204,4 +211,10 @@ export type RoleOutput = ScoutOutput | BuilderOutput | VerifierOutput | CriticOu
 export interface ErrorResponse {
   error: string;
   code?: string;
+  /** Raw text the model returned, when the failure was a schema/parse error.
+   *  Truncated to a sensible cap. Surfaced so the platform's onboarding UI
+   *  (and run-time error logs) can show what the model actually produced. */
+  rawOutput?: string;
+  /** Human-readable detail describing why parsing/validation failed. */
+  validationError?: string;
 }

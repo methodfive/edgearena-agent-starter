@@ -77,9 +77,14 @@ type OutputKind = 'scout' | 'builder' | 'verifier' | 'critic';
 export class AgentTaskError extends Error {
   override readonly name = 'AgentTaskError';
   readonly reason: 'llm_error' | 'invalid_output';
-  constructor(reason: 'llm_error' | 'invalid_output', message: string) {
+  /** Raw model text that failed to parse/validate. Set on `invalid_output`
+   *  failures so the caller (platform onboarding UI, run-time error logs)
+   *  can show what the model actually produced. */
+  readonly rawOutput?: string;
+  constructor(reason: 'llm_error' | 'invalid_output', message: string, rawOutput?: string) {
     super(message);
     this.reason = reason;
+    this.rawOutput = rawOutput;
   }
 }
 
@@ -146,6 +151,7 @@ async function runLlm(
     throw new AgentTaskError(
       'invalid_output',
       `${kind} output failed validation: ${parsed.error}`,
+      res.text,
     );
   }
   if (parsed.repaired) logInfo('output_repaired', { kind, taskId: opts.taskId });
