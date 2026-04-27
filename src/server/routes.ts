@@ -26,7 +26,7 @@ import {
   ScoutSimulationSchema,
   formatZodError,
 } from '../protocol/validate';
-import { logError } from '../utils/logger';
+import { logError, logInfo } from '../utils/logger';
 import { verifySignature } from '../utils/signature';
 
 export interface RawBodyRequest extends Request {
@@ -203,6 +203,14 @@ async function handleDispatchRequest(req: RawBodyRequest, res: Response): Promis
   }
   rememberTaskId(parsed.data.taskId);
 
+  const dispatchStartedAt = Date.now();
+  logInfo('dispatch_received', {
+    taskId: parsed.data.taskId,
+    runId: parsed.data.runId,
+    phase: parsed.data.phase,
+    role: parsed.data.role,
+  });
+
   try {
     const { output, usage } = await handleDispatch(parsed.data, {
       timeoutMs: config.llm.timeoutMs,
@@ -215,8 +223,17 @@ async function handleDispatchRequest(req: RawBodyRequest, res: Response): Promis
       modelId: usage.modelId,
     };
     res.status(200).json(response);
+    logInfo('dispatch_completed', {
+      taskId: parsed.data.taskId,
+      latencyMs: Date.now() - dispatchStartedAt,
+      promptTokens: usage.promptTokens,
+      completionTokens: usage.completionTokens,
+    });
   } catch (err) {
-    writeAgentError(res, err, 'dispatch_failed', { taskId: parsed.data.taskId });
+    writeAgentError(res, err, 'dispatch_failed', {
+      taskId: parsed.data.taskId,
+      latencyMs: Date.now() - dispatchStartedAt,
+    });
   }
 }
 
