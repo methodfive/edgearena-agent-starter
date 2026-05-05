@@ -147,16 +147,63 @@ async function runLlm(
 
   const schema = schemaFor(kind);
   const parsed = parseAndValidate(res.text, schema);
-  if (!parsed.ok) {
+  if (parsed.ok) {
+    if (parsed.repaired) logInfo('output_repaired', { kind, taskId: opts.taskId });
+    return { output: parsed.data, usage: res };
+  }
+
+  // One-shot repair retry. Smaller models drop required fields under the
+  // platform's heavier multi-section prompts; we hand the model its own
+  // broken output along with the validator's complaint and ask it to emit
+  // the corrected JSON. We don't loop further — if repair also fails the
+  // model isn't going to converge and we want to surface the failure fast.
+  logInfo('output_repair_attempt', { kind, taskId: opts.taskId, validationError: parsed.error });
+  let retry;
+  try {
+    retry = await callChat(
+      config.llm,
+      [
+        ...messages,
+        { role: 'assistant', content: res.text },
+        {
+          role: 'user',
+          content:
+            `Your previous reply failed JSON-schema validation: ${parsed.error}.\n\n` +
+            `Return the corrected response as a single JSON object with every required field. ` +
+            `Do not add any commentary or markdown — JSON only.`,
+        },
+      ],
+      { timeoutMs: opts.timeoutMs, taskId: opts.taskId },
+    );
+  } catch (err) {
+    const msg = err instanceof LlmError ? err.message : (err as Error).message;
     throw new AgentTaskError(
       'invalid_output',
-      `${kind} output failed validation: ${parsed.error}`,
+      `${kind} output failed validation and repair retry errored: ${parsed.error}; retry: ${msg}`,
       res.text,
     );
   }
-  if (parsed.repaired) logInfo('output_repaired', { kind, taskId: opts.taskId });
 
-  return { output: parsed.data, usage: res };
+  const repaired = parseAndValidate(retry.text, schema);
+  if (!repaired.ok) {
+    throw new AgentTaskError(
+      'invalid_output',
+      `${kind} output failed validation after repair retry. First: ${parsed.error}; retry: ${repaired.error}`,
+      retry.text,
+    );
+  }
+  logInfo('output_repaired_via_retry', { kind, taskId: opts.taskId });
+  return {
+    output: repaired.data,
+    // Charge both completions to the caller so token accounting reflects
+    // what was actually spent. Keep the model id from the retry — it's the
+    // call that produced the response we returned.
+    usage: {
+      promptTokens: res.promptTokens + retry.promptTokens,
+      completionTokens: res.completionTokens + retry.completionTokens,
+      modelId: retry.modelId,
+    },
+  };
 }
 
 function schemaFor(kind: OutputKind): ZodType<RoleOutput> {

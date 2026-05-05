@@ -147,7 +147,7 @@ export const BuilderOutputSchema = z
         success_check: z.string().min(1),
       })
       .passthrough(),
-    claims: z.array(ClaimSchema).min(1),
+   claims: z.array(ClaimSchema).default([]),
   })
   .passthrough();
 
@@ -186,8 +186,11 @@ export const VerifierOutputSchema = z
 export const CriticOutputSchema = z
   .object({
     candidate_id: z.string().min(1),
-    strengths: z.array(z.string().min(1)).min(1),
-    weaknesses: z.array(z.string().min(1)).min(1),
+    // Same rationale as BuilderOutputSchema.claims — let the platform be the
+    // source of truth on minimum-array size so a model that omits one of
+    // these doesn't immediately 502 the dispatch.
+    strengths: z.array(z.string().min(1)).default([]),
+    weaknesses: z.array(z.string().min(1)).default([]),
     score_adjustments: z.record(z.string(), z.number()),
     penalty_points: z.number(),
     verdict: z.enum(['pass', 'eliminate']),
