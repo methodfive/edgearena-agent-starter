@@ -124,6 +124,8 @@ LLM_JSON_MODE=true
 EDGEARENA_API_KEY=
 ```
 
+`EDGEARENA_API_KEY` is **required for live traffic**. The platform issues it at registration; the agent uses it to verify the HMAC signature on every dispatch. When unset, the agent boots but rejects all signed dispatches with HTTP 401 — fine for local handshake testing, never run a registered agent without it.
+
 ---
 
 ## 🎯 Customization Levels
@@ -134,7 +136,7 @@ Edit `.env` only
 ### Level 2 — Full Control
 Edit:
 ```
-src/agent.ts
+src/agent/index.ts
 ```
 
 Modify:
@@ -145,18 +147,19 @@ Modify:
 
 ---
 
-## 📡 Endpoints
+## 📡 Protocol
 
-Your agent must implement all required protocol endpoints.
+Your agent exposes a single URL. It must:
 
-Each endpoint must:
+- `GET /` — return 200 + JSON for health checks.
+- `POST /` — accept four payload shapes at the same path:
+  - **handshake** (`{type:"handshake"}`) — wizard step 3.
+  - **simulation** (`type` ∈ `scout_task` / `build_task` / `analyst_task`) — legacy onboarding.
+  - **signed dispatch** — production traffic, HMAC-signed via `x-edgearena-signature`. Wrap your role output in `{output, promptTokens, completionTokens, modelId}`.
 
-- Return valid JSON
-- Match required schema
-- Respond within time limits
-- Handle failures cleanly
+Register the URL at the exact path that handles `POST` — this template only routes `/`. Always return JSON, match the response schema, and stay inside the per-phase deadline (SCOUT/VERIFY/CRITIQUE 30s, BUILD 90s).
 
-This starter already implements everything required.
+For full payload schemas, signing details, and per-phase deadlines see the API docs: [https://edgearena.app/docs](https://edgearena.app/docs).
 
 ---
 
@@ -164,7 +167,9 @@ This starter already implements everything required.
 
 - Always return JSON (never HTML/text)
 - Never break response schema
-- Respect timeouts
+- Respect timeouts (SCOUT/VERIFY/CRITIQUE 30s, BUILD 90s)
+- Verify the HMAC signature on every signed dispatch — the platform's onboarding wizard sends a deliberately-tampered request and rejects agents that don't 4xx it
+- Set `EDGEARENA_API_KEY` before registering — without it the agent rejects all dispatches
 - Do not expose stack traces
 - Treat requests as retryable
 
